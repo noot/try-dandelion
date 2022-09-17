@@ -6,17 +6,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 	"os"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
 	libp2phost "github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/peer"
-	ma "github.com/multiformats/go-multiaddr"
 	"github.com/libp2p/go-libp2p-pubsub"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
+	ma "github.com/multiformats/go-multiaddr"
 
-	//"github.com/chyeh/pubip"
 	logging "github.com/ipfs/go-log"
 	"github.com/urfave/cli/v2"
 )
@@ -31,9 +31,9 @@ const (
 var log = logging.Logger("main")
 
 var (
-	flagBootnodes = "bootnodes"
-	flagCount = "count"
-	flagDuration = "duration"
+	flagCount     = "count"
+	flagDuration  = "duration"
+	flagDandelion = "dandelion"
 
 	app = &cli.App{
 		Name:                 "try-dandelion",
@@ -42,11 +42,6 @@ var (
 		EnableBashCompletion: true,
 		Suggest:              true,
 		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:  flagBootnodes,
-				Usage: "comma-separated list of bootnodes",
-				Value: "",
-			},
 			&cli.UintFlag{
 				Name:  flagCount,
 				Usage: "number of nodes to run",
@@ -55,7 +50,12 @@ var (
 			&cli.UintFlag{
 				Name:  flagDuration,
 				Usage: "length of time to run simulation in seconds",
-				Value: 120,
+				Value: 60,
+			},
+			&cli.BoolFlag{
+				Name:  flagDandelion,
+				Usage: "whether to run with dandelion or normal gossipsub",
+				Value: false,
 			},
 		},
 	}
@@ -77,16 +77,16 @@ func run(c *cli.Context) error {
 
 	count := int(c.Uint(flagCount))
 	mlt := newMessageLatencyTracker(count)
-	go mlt.trackRecieved()
 
 	for i := 0; i < count; i++ {
 		log.Infof("starting node %d", i)
 		cfg := &config{
-			Ctx: context.Background(),
-			Port: uint16(basePort + i),
+			Ctx:       context.Background(),
+			Port:      uint16(basePort + i),
 			Bootnodes: bootnodes,
-			Index: i,
-			Tracker: mlt,
+			Index:     i,
+			Tracker:   mlt,
+			dandelion: c.Bool(flagDandelion),
 		}
 
 		h, err := NewHost(cfg)
@@ -123,21 +123,22 @@ func run(c *cli.Context) error {
 }
 
 type config struct {
-	Ctx         context.Context
-	Port        uint16
-	KeyFile     string
-	Bootnodes   []peer.AddrInfo
-	Index int
-	Tracker *messageLatencyTracker
+	Ctx       context.Context
+	Port      uint16
+	KeyFile   string
+	Bootnodes []peer.AddrInfo
+	Index     int
+	Tracker   *messageLatencyTracker
+	dandelion bool
 }
 
 type host struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	h libp2phost.Host
+	ctx       context.Context
+	cancel    context.CancelFunc
+	h         libp2phost.Host
 	bootnodes []peer.AddrInfo
-	topics map[string]*pubsub.Topic
-	tracker *messageLatencyTracker
+	topics    map[string]*pubsub.Topic
+	tracker   *messageLatencyTracker
 }
 
 func NewHost(cfg *config) (*host, error) {
@@ -159,34 +160,12 @@ func NewHost(cfg *config) (*host, error) {
 		return nil, err
 	}
 
-	// var externalAddr ma.Multiaddr
-	// ip, err := pubip.Get()
-	// if err != nil {
-	// 	log.Warnf("failed to get public IP error: %v", err)
-	// } else {
-	// 	log.Debugf("got public IP address %s", ip)
-	// 	externalAddr, err = ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", ip, cfg.Port))
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// }
-
 	opts := []libp2p.Option{
 		libp2p.ListenAddrs(addr),
 		libp2p.Identity(key),
 		libp2p.NATPortMap(),
-		// libp2p.AddrsFactory(func(addrs []ma.Multiaddr) []ma.Multiaddr {
-		// 	return append(addrs, externalAddr)
-		// }),
 	}
 
-	// // format bootnodes
-	// bns, err := stringsToAddrInfos(cfg.Bootnodes)
-	// if err != nil {
-	// 	return nil, fmt.Errorf("failed to format bootnodes: %w", err)
-	// }
-
-	// create libp2p host instance
 	h, err := libp2p.New(opts...)
 	if err != nil {
 		return nil, err
@@ -194,6 +173,11 @@ func NewHost(cfg *config) (*host, error) {
 
 	psOpts := []pubsub.Option{
 		pubsub.WithMessageIdFn(messageIDFn),
+		pubsub.WithMessageSignaturePolicy(pubsub.StrictNoSign),
+	}
+
+	if cfg.dandelion {
+		psOpts = append(psOpts, pubsub.WithDandelion())
 	}
 
 	ps, err := pubsub.NewGossipSub(cfg.Ctx, h, psOpts...)
@@ -212,12 +196,12 @@ func NewHost(cfg *config) (*host, error) {
 
 	ourCtx, cancel := context.WithCancel(cfg.Ctx)
 	return &host{
-		ctx: ourCtx,
-		cancel: cancel,
-		h: h,
+		ctx:       ourCtx,
+		cancel:    cancel,
+		h:         h,
 		bootnodes: cfg.Bootnodes,
-		topics: topics,
-		tracker: cfg.Tracker,
+		topics:    topics,
+		tracker:   cfg.Tracker,
 	}, nil
 }
 
@@ -253,8 +237,12 @@ func (h *host) Start() error {
 		}()
 	}
 
-	// TODO: make random
-	ticker := time.NewTicker(time.Second * 10)
+	randDuration, err := rand.Int(rand.Reader, big.NewInt(20))
+	if err != nil {
+		return err
+	}
+
+	ticker := time.NewTicker(time.Second * time.Duration(20+randDuration.Int64()))
 	go func() {
 		for {
 			select {
@@ -262,13 +250,18 @@ func (h *host) Start() error {
 				ticker.Stop()
 				return
 			case <-ticker.C:
+				ok := true
 				go func() {
 					err := h.publishRandomMessages()
 					if err != nil {
 						log.Warnf("send loop exiting: %s", err)
-						return	
+						ok = false
+						return
 					}
 				}()
+				if !ok {
+					return
+				}
 			}
 		}
 	}()
@@ -351,7 +344,7 @@ func (h *host) receive(topic string) error {
 		}
 
 		log.Infof("got message on topic %s: id %s", topic, msg.ID)
-		h.tracker.ch <- msg.ID
+		h.tracker.logReceived(msg.ID)
 	}
 
 	return nil

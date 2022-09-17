@@ -5,6 +5,6 @@ import (
 )
 
 var (
-	errFailedToBootstrap     = errors.New("failed to bootstrap to any bootnode")
-	errNoTopic = errors.New("given topic does not exist")
+	errFailedToBootstrap = errors.New("failed to bootstrap to any bootnode")
+	errNoTopic           = errors.New("given topic does not exist")
 )
