@@ -70,7 +70,7 @@ func main() {
 func run(c *cli.Context) error {
 	_ = logging.SetLogLevel("main", "info")
 
-	const basePort = 5000
+	const basePort = 6000
 
 	bootnodes := []peer.AddrInfo{}
 	hosts := []*host{}
@@ -99,7 +99,7 @@ func run(c *cli.Context) error {
 			return err
 		}
 
-		time.Sleep(time.Second)
+		time.Sleep(time.Millisecond * 200)
 		log.Infof("node %d started: %s", i, h.addrInfo())
 		bootnodes = append(bootnodes, h.addrInfo())
 		hosts = append(hosts, h)
